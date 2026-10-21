@@ -29,10 +29,14 @@ const BASE =
 const TABLE_QUERY =
   "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '_cf_%' ORDER BY name";
 
+async function listTables(DB: D1Database): Promise<string[]> {
+  const res = await DB.prepare(TABLE_QUERY).all();
+  return (res.results as { name: string }[]).map((r) => r.name);
+}
+
 export async function GET() {
   const DB = getRequestContext().env.DB as unknown as D1Database;
-  const before = await DB.prepare(TABLE_QUERY).all();
-  const beforeNames = (before.results as { name: string }[]).map((r) => r.name);
+  const beforeNames = await listTables(DB);
   if (beforeNames.length > 0) {
     return NextResponse.json({
       status: "already-migrated",
@@ -51,24 +55,41 @@ export async function GET() {
     }
     combined += (await res.text()) + "\n";
   }
-  const cleaned = combined
+  const statements = combined
+    .replace(/--> statement-breakpoint/g, "")
     .split("\n")
-    .filter((l) => !l.trim().toUpperCase().startsWith("PRAGMA"))
-    .join("\n");
-  try {
-    await DB.exec(cleaned);
-  } catch (e) {
-    const now = await DB.prepare(TABLE_QUERY).all();
-    return NextResponse.json(
-      {
-        status: "exec-error",
-        error: String(e),
-        tablesSoFar: (now.results as { name: string }[]).map((r) => r.name),
-      },
-      { status: 500 }
-    );
+    .filter((l) => {
+      const t = l.trim();
+      return !t.startsWith("--") && !t.toUpperCase().startsWith("PRAGMA");
+    })
+    .join("\n")
+    .split(";")
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  let applied = 0;
+  for (const stmt of statements) {
+    try {
+      await DB.prepare(stmt).run();
+      applied++;
+    } catch (e) {
+      return NextResponse.json(
+        {
+          status: "exec-error",
+          appliedBeforeError: applied,
+          totalStatements: statements.length,
+          failedStatement: stmt.slice(0, 200),
+          error: String(e),
+          tablesSoFar: await listTables(DB),
+        },
+        { status: 500 }
+      );
+    }
   }
-  const after = await DB.prepare(TABLE_QUERY).all();
-  const names = (after.results as { name: string }[]).map((r) => r.name);
-  return NextResponse.json({ status: "migrated", count: names.length, tables: names });
+  const names = await listTables(DB);
+  return NextResponse.json({
+    status: "migrated",
+    statementsApplied: applied,
+    count: names.length,
+    tables: names,
+  });
 }
